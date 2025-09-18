@@ -387,16 +387,16 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["tournament", "metaculus_cup", "test_questions"],
+        choices=["tournament", "market-pulse-25q3", "metaculus-cup-fall-2025"],
         default="tournament",
         help="Specify the run mode (default: tournament)",
     )
     args = parser.parse_args()
-    run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
+    run_mode: Literal["tournament", "market-pulse-25q3", "metaculus-cup-fall-2025"] = args.mode
     assert run_mode in [
         "tournament",
-        "metaculus_cup",
-        "test_questions",
+        "market-pulse-25q3",
+        "metaculus-cup-fall-2025",
     ], "Invalid run mode"
 
     template_bot = FallTemplateBot2025(
@@ -414,7 +414,7 @@ if __name__ == "__main__":
         #         allowed_tries=2,
         #     ),
         #     "summarizer": "openai/gpt-4o-mini",
-        #     "researcher": "asknews/deep-research/low",
+        #     "researcher": "asknews/deep-research/low", 
         #     "parser": "openai/gpt-4o-mini",
         # },
     )
