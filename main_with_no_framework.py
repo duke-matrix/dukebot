@@ -153,7 +153,7 @@ async def forecast_questions(tournament_id: int | str, submit_prediction: bool =
 # Main entrypoint
 # -----------------------------
 async def main():
-    tournaments = ["32813", "fall-aib-2025","minibench"]  # Example tournaments
+    tournaments = ["32813", "fall-aib-2025", "minibench","32773", "market-pulse-25q3", "metaculus-cup-fall-2025"]  # Example tournaments
     for tid in tournaments:
         await forecast_questions(tid, submit_prediction=False)
 
