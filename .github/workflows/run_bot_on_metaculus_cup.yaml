@@ -1,4 +1,4 @@
-name: Forecast on Metaculus Cup
+name: Forecast on Market-pulse-25q3
 
 on:
   workflow_dispatch:
@@ -32,7 +32,7 @@ jobs:
         run: poetry install --no-interaction --no-root
       - name: Run bot
         run: |
-          poetry run python main.py --mode metaculus_cup
+          poetry run python main.py --mode market-pulse-25q3
         # this reads the environment variables from the github repository.
         # Store under Settings --> Secrets and variables --> Actions
         env:
