@@ -3,9 +3,6 @@ import asyncio
 import logging
 from datetime import datetime
 from typing import Literal
-import os
-from tavily import TavilyClient
-from newsapi import NewsApiClient
 
 from forecasting_tools import (
     AskNewsSearcher,
