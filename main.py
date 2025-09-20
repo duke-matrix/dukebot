@@ -4,6 +4,9 @@ import logging
 from datetime import datetime
 from typing import Literal
 from tavily import TavilyClient
+import os
+api_key = os.getenv("TAVILY_API_KEY")
+client = TavilyClient(api_key)
 
 from forecasting_tools import (
     AskNewsSearcher,
