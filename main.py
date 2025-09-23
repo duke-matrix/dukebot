@@ -1,11 +1,16 @@
+# A forecasting bot using a multi-model ensemble and a hybrid research pipeline.
 import argparse
 import asyncio
 import logging
+import os
 from datetime import datetime
 from typing import Literal
 
+import numpy as np
 from forecasting_tools import (
-    AskNewsSearcher,
+    AskNewsSearcher,  # For potential future use
+    SmartSearcher,  # For potential future use
+    BinaryPrediction,
     BinaryQuestion,
     ForecastBot,
     GeneralLlm,
@@ -15,445 +20,308 @@ from forecasting_tools import (
     NumericDistribution,
     NumericQuestion,
     Percentile,
-    BinaryPrediction,
     PredictedOptionList,
     ReasonedPrediction,
-    SmartSearcher,
     clean_indents,
     structure_output,
 )
+from newsapi import NewsApiClient
+from tavily import TavilyClient
 
-logger = logging.getLogger(__name__)
+# -----------------------------
+# Environment & API Keys
+# -----------------------------
+NEWSAPI_API_KEY = os.getenv("NEWSAPI_API_KEY")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+
+# -----------------------------
+# Logging setup
+# -----------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger("UnifiedForecastBot")
 
 
-class FallTemplateBot2025(ForecastBot):
+class UnifiedForecastingBot(ForecastBot):
     """
-    This is a copy of the template bot for Fall 2025 Metaculus AI Tournament.
-    This bot is what is used by Metaculus in our benchmark, but is also provided as a template for new bot makers.
-    This template is given as-is, and though we have covered most test cases
-    in forecasting-tools it may be worth double checking key components locally.
-
-    Main changes since Q2:
-    - An LLM now parses the final forecast output (rather than programmatic parsing)
-    - Added resolution criteria and fine print explicitly to the research prompt
-    - Previously in the prompt, nothing about upper/lower bound was shown when the bounds were open. Now a suggestion is made when this is the case.
-    - Support for nominal bounds was added (i.e. when there are discrete questions and normal upper/lower bounds are not as intuitive)
-
-    The main entry point of this bot is `forecast_on_tournament` in the parent class.
-    See the script at the bottom of the file for more details on how to run the bot.
-    Ignoring the finer details, the general flow is:
-    - Load questions from Metaculus
-    - For each question
-        - Execute run_research a number of times equal to research_reports_per_question
-        - Execute respective run_forecast function `predictions_per_research_report * research_reports_per_question` times
-        - Aggregate the predictions
-        - Submit prediction (if publish_reports_to_metaculus is True)
-    - Return a list of ForecastReport objects
-
-    Only the research and forecast functions need to be implemented in ForecastBot subclasses,
-    though you may want to override other ones.
-    In this example, you can change the prompts to be whatever you want since,
-    structure_output uses an LLMto intelligently reformat the output into the needed structure.
-
-    By default (i.e. 'tournament' mode), when you run this script, it will forecast on any open questions for the
-    MiniBench and Seasonal AIB tournaments. If you want to forecast on only one or the other, you can remove one
-    of them from the 'tournament' mode code at the bottom of the file.
-
-    You can experiment with what models work best with your bot by using the `llms` parameter when initializing the bot.
-    You can initialize the bot with any number of models. For example,
-    ```python
-    my_bot = MyBot(
-        ...
-        llms={  # choose your model names or GeneralLlm llms here, otherwise defaults will be chosen for you
-            "default": GeneralLlm(
-                model="openrouter/openai/gpt-4o", # "anthropic/claude-3-5-sonnet-20241022", etc (see docs for litellm)
-                temperature=0.3,
-                timeout=40,
-                allowed_tries=2,
-            ),
-            "summarizer": "openai/gpt-4o-mini",
-            "researcher": "asknews/deep-research/low",
-            "parser": "openai/gpt-4o-mini",
-        },
-    )
-    ```
-
-    Then you can access the model in custom functions like this:
-    ```python
-    research_strategy = self.get_llm("researcher", "model_name"
-    if research_strategy == "asknews/deep-research/low":
-        ...
-    # OR
-    summarizer = await self.get_llm("summarizer", "model_name").invoke(prompt)
-    # OR
-    reasoning = await self.get_llm("default", "llm").invoke(prompt)
-    ```
-
-    If you end up having trouble with rate limits and want to try a more sophisticated rate limiter try:
-    ```python
-    from forecasting_tools import RefreshingBucketRateLimiter
-    rate_limiter = RefreshingBucketRateLimiter(
-        capacity=2,
-        refresh_rate=1,
-    ) # Allows 1 request per second on average with a burst of 2 requests initially. Set this as a class variable
-    await self.rate_limiter.wait_till_able_to_acquire_resources(1) # 1 because it's consuming 1 request (use more if you are adding a token limit)
-    ```
-    Additionally OpenRouter has large rate limits immediately on account creation
+    This bot uses a three-model ensemble for forecasting and integrates custom
+    research functions with an LLM-powered synthesis step.
     """
 
-    _max_concurrent_questions = (
-        1  # Set this to whatever works for your search-provider/ai-model rate limits
-    )
+    _max_concurrent_questions = 1
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
 
+    def _llm_config_defaults(self) -> dict[str, str]:
+        """
+        Registers custom forecaster roles to suppress warnings.
+        """
+        defaults = super()._llm_config_defaults()
+        defaults.update({
+            "forecaster_1": "qwen/qwen-2-72b-instruct",
+            "forecaster_2": "openai/gpt-4o-mini",
+            "forecaster_3": "mistralai/mistral-large-latest",
+        })
+        return defaults
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.newsapi_client = NewsApiClient(api_key=NEWSAPI_API_KEY)
+        self.tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
+        # Updated to a three-model ensemble
+        self.forecaster_keys = ["forecaster_1", "forecaster_2", "forecaster_3"]
+
+    # --- Custom Research Implementation ---
+
     async def run_research(self, question: MetaculusQuestion) -> str:
+        """
+        Orchestrates research calls from Tavily and NewsAPI, then uses an LLM to synthesize the results.
+        """
         async with self._concurrency_limiter:
-            research = ""
-            researcher = self.get_llm("researcher")
+            logger.info(f"--- Running Raw Data Research for: {question.question_text} ---")
 
-            prompt = clean_indents(
-                f"""
-                You are an assistant to a superforecaster.
-                The superforecaster will give you a question they intend to forecast on.
-                To be a great assistant, you generate a concise but detailed rundown of the most relevant news, including if the question would resolve Yes or No based on current information.
-                You do not produce forecasts yourself.
+            loop = asyncio.get_running_loop()
+            tasks = {
+                "tavily": loop.run_in_executor(None, self.call_tavily, question.question_text),
+                "news": loop.run_in_executor(None, self.call_newsapi, question.question_text),
+            }
+            results = await asyncio.gather(*tasks.values(), return_exceptions=True)
 
-                Question:
-                {question.question_text}
+            tavily_results, news_results = results[0], results[1]
 
-                This question's outcome will be determined by the specific criteria below:
-                {question.resolution_criteria}
+            raw_research = f"Tavily Research Summary:\n{tavily_results}\n\nRecent News:\n{news_results}"
 
-                {question.fine_print}
-                """
-            )
+            # New Synthesis Step
+            logger.info(f"--- Synthesizing Raw Research for: {question.question_text} ---")
+            synthesis_prompt = clean_indents(f"""
+                Analyze the following raw research data from Tavily and NewsAPI, then provide a concise, synthesized summary for a forecaster.
+                Focus on the key drivers, potential turning points, and any conflicting information.
 
-            if isinstance(researcher, GeneralLlm):
-                research = await researcher.invoke(prompt)
-            elif researcher == "asknews/news-summaries":
-                research = await AskNewsSearcher().get_formatted_news_async(
-                    question.question_text
-                )
-            elif researcher == "asknews/deep-research/medium-depth":
-                research = await AskNewsSearcher().get_formatted_deep_research(
-                    question.question_text,
-                    sources=["asknews", "google"],
-                    search_depth=2,
-                    max_depth=4,
-                )
-            elif researcher == "asknews/deep-research/high-depth":
-                research = await AskNewsSearcher().get_formatted_deep_research(
-                    question.question_text,
-                    sources=["asknews", "google"],
-                    search_depth=4,
-                    max_depth=6,
-                )
-            elif researcher.startswith("smart-searcher"):
-                model_name = researcher.removeprefix("smart-searcher/")
-                searcher = SmartSearcher(
-                    model=model_name,
-                    temperature=0,
-                    num_searches_to_run=2,
-                    num_sites_per_search=10,
-                    use_advanced_filters=False,
-                )
-                research = await searcher.invoke(prompt)
-            elif not researcher or researcher == "None":
-                research = ""
-            else:
-                research = await self.get_llm("researcher", "llm").invoke(prompt)
-            logger.info(f"Found Research for URL {question.page_url}:\n{research}")
-            return research
+                Raw Data:
+                {raw_research}
 
-    async def _run_forecast_on_binary(
-        self, question: BinaryQuestion, research: str
-    ) -> ReasonedPrediction[float]:
+                Synthesized Summary:
+            """)
+
+            synthesized_research = await self.get_llm("researcher", "llm").invoke(synthesis_prompt)
+
+            logger.info(f"--- Research Complete for Q {question.page_url} ---\n{synthesized_research[:400]}...\n--------------------")
+            return synthesized_research
+
+    def call_tavily(self, query: str) -> str:
+        """Performs a research search using Tavily."""
+        if not self.tavily_client.api_key:
+            return "Tavily search not performed (API key not set)."
+        try:
+            response = self.tavily_client.search(query=query, search_depth="advanced")
+            return "\n".join([f"- {c['content']}" for c in response['results']])
+        except Exception as e:
+            return f"Tavily search failed: {e}"
+
+    def call_newsapi(self, query: str) -> str:
+        """Fetches recent news articles from NewsAPI."""
+        if not self.newsapi_client.api_key:
+            return "NewsAPI search not performed (API key not set)."
+        try:
+            articles = self.newsapi_client.get_everything(q=query, language='en', sort_by='relevancy', page_size=5)
+            if not articles or not articles.get('articles'):
+                return "No recent news articles found."
+            return "\n".join([f"- Title: {a['title']}\n  Snippet: {a.get('description', 'N/A')}" for a in articles['articles']])
+        except Exception as e:
+            return f"NewsAPI search failed: {e}"
+
+    # --- Multi-Model Forecasting Logic ---
+
+    async def _get_reasonings_from_all_models(self, prompt: str) -> list[str]:
+        """Invokes all configured forecaster models with the same prompt."""
+        tasks = [self.get_llm(key, "llm").invoke(prompt) for key in self.forecaster_keys]
+        return await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _combine_reasonings_for_comment(self, reasonings: list) -> str:
+        """Formats reasonings from all models into a single string for submission."""
+        comment = ""
+        for i, reasoning in enumerate(reasonings):
+            model_key = self.forecaster_keys[i]
+            model_name = self.get_llm(model_key, "model_name")
+            comment += f"--- Reasoning from Model: {model_name} ---\n\n"
+            comment += f"ERROR: {reasoning}\n\n" if isinstance(reasoning, Exception) else f"{reasoning}\n\n"
+        return comment
+
+    async def _run_forecast_on_binary(self, question: BinaryQuestion, research: str) -> ReasonedPrediction[float]:
         prompt = clean_indents(
             f"""
-            You are a professional forecaster interviewing for a job.
-
-            Your interview question is:
+            You are a professional superforecaster. Your interview question is:
             {question.question_text}
-
-            Question background:
-            {question.background_info}
-
-
-            This question's outcome will be determined by the specific criteria below. These criteria have not yet been satisfied:
-            {question.resolution_criteria}
-
+            Background: {question.background_info}
+            Resolution Criteria: {question.resolution_criteria}
             {question.fine_print}
-
-
             Your research assistant says:
             {research}
-
             Today is {datetime.now().strftime("%Y-%m-%d")}.
-
             Before answering you write:
             (a) The time left until the outcome to the question is known.
             (b) The status quo outcome if nothing changed.
-            (c) A brief description of a scenario that results in a No outcome.
-            (d) A brief description of a scenario that results in a Yes outcome.
-
-            You write your rationale remembering that good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time.
-
+            (c) A scenario that results in a No outcome.
+            (d) A scenario that results in a Yes outcome.
+            You write your rationale, putting extra weight on the status quo.
             The last thing you write is your final answer as: "Probability: ZZ%", 0-100
             """
         )
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
-        binary_prediction: BinaryPrediction = await structure_output(
-            reasoning, BinaryPrediction, model=self.get_llm("parser", "llm")
-        )
-        decimal_pred = max(0.01, min(0.99, binary_prediction.prediction_in_decimal))
+        reasonings = await self._get_reasonings_from_all_models(prompt)
+        parsing_tasks = [structure_output(r, BinaryPrediction, self.get_llm("parser", "llm")) for r in reasonings if not isinstance(r, Exception)]
+        predictions = await asyncio.gather(*parsing_tasks, return_exceptions=True)
+        valid_preds = [p.prediction_in_decimal for p in predictions if not isinstance(p, Exception)]
+        if not valid_preds: raise ValueError("All model predictions failed parsing.")
+        median_pred = float(np.median(valid_preds))
+        final_pred = max(0.01, min(0.99, median_pred))
+        combined_reasoning = self._combine_reasonings_for_comment(reasonings)
+        logger.info(f"Forecasted {question.page_url} with median prediction: {final_pred}")
+        return ReasonedPrediction(prediction_value=final_pred, reasoning=combined_reasoning)
 
-        logger.info(
-            f"Forecasted URL {question.page_url} with prediction: {decimal_pred}"
-        )
-        return ReasonedPrediction(prediction_value=decimal_pred, reasoning=reasoning)
-
-    async def _run_forecast_on_multiple_choice(
-        self, question: MultipleChoiceQuestion, research: str
-    ) -> ReasonedPrediction[PredictedOptionList]:
+    async def _run_forecast_on_multiple_choice(self, question: MultipleChoiceQuestion, research: str) -> ReasonedPrediction[PredictedOptionList]:
         prompt = clean_indents(
             f"""
-            You are a professional forecaster interviewing for a job.
-
-            Your interview question is:
+            You are a professional superforecaster. Your question is:
             {question.question_text}
-
-            The options are: {question.options}
-
-
-            Background:
-            {question.background_info}
-
+            Options: {question.options}
+            Background: {question.background_info}
             {question.resolution_criteria}
-
-            {question.fine_print}
-
-
-            Your research assistant says:
+            Research:
             {research}
-
             Today is {datetime.now().strftime("%Y-%m-%d")}.
-
-            Before answering you write:
-            (a) The time left until the outcome to the question is known.
-            (b) The status quo outcome if nothing changed.
-            (c) A description of an scenario that results in an unexpected outcome.
-
-            You write your rationale remembering that (1) good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time, and (2) good forecasters leave some moderate probability on most options to account for unexpected outcomes.
-
-            The last thing you write is your final probabilities for the N options in this order {question.options} as:
+            Write your rationale, considering the status quo and unexpected outcomes.
+            The last thing you write is your final probabilities for the options {question.options} as:
             Option_A: Probability_A
             Option_B: Probability_B
             ...
-            Option_N: Probability_N
             """
         )
-        parsing_instructions = clean_indents(
-            f"""
-            Make sure that all option names are one of the following:
-            {question.options}
-            The text you are parsing may prepend these options with some variation of "Option" which you should remove if not part of the option names I just gave you.
-            """
-        )
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
-        predicted_option_list: PredictedOptionList = await structure_output(
-            text_to_structure=reasoning,
-            output_type=PredictedOptionList,
-            model=self.get_llm("parser", "llm"),
-            additional_instructions=parsing_instructions,
-        )
-        logger.info(
-            f"Forecasted URL {question.page_url} with prediction: {predicted_option_list}"
-        )
-        return ReasonedPrediction(
-            prediction_value=predicted_option_list, reasoning=reasoning
-        )
+        parsing_instructions = f"Ensure option names are one of: {question.options}"
+        reasonings = await self._get_reasonings_from_all_models(prompt)
+        parsing_tasks = [structure_output(r, PredictedOptionList, self.get_llm("parser", "llm"), additional_instructions=parsing_instructions) for r in reasonings if not isinstance(r, Exception)]
+        predictions = await asyncio.gather(*parsing_tasks, return_exceptions=True)
+        valid_preds = [p for p in predictions if not isinstance(p, Exception)]
+        if not valid_preds: raise ValueError("All model predictions failed parsing.")
+        avg_probs = {option: np.mean([p.get_prob(option) for p in valid_preds]) for option in question.options}
+        total_prob = sum(avg_probs.values())
+        final_probs = {option: prob / total_prob for option, prob in avg_probs.items()}
+        final_prediction = PredictedOptionList(list(final_probs.items()))
+        combined_reasoning = self._combine_reasonings_for_comment(reasonings)
+        logger.info(f"Forecasted {question.page_url} with prediction: {final_prediction}")
+        return ReasonedPrediction(prediction_value=final_prediction, reasoning=combined_reasoning)
 
-    async def _run_forecast_on_numeric(
-        self, question: NumericQuestion, research: str
-    ) -> ReasonedPrediction[NumericDistribution]:
-        upper_bound_message, lower_bound_message = (
-            self._create_upper_and_lower_bound_messages(question)
-        )
+    async def _run_forecast_on_numeric(self, question: NumericQuestion, research: str) -> ReasonedPrediction[NumericDistribution]:
+        upper_bound_message, lower_bound_message = self._create_upper_and_lower_bound_messages(question)
         prompt = clean_indents(
             f"""
-            You are a professional forecaster interviewing for a job.
-
-            Your interview question is:
+            You are a professional superforecaster. Your question is:
             {question.question_text}
-
-            Background:
-            {question.background_info}
-
-            {question.resolution_criteria}
-
-            {question.fine_print}
-
-            Units for answer: {question.unit_of_measure if question.unit_of_measure else "Not stated (please infer this)"}
-
-            Your research assistant says:
+            Background: {question.background_info}
+            Units for answer: {question.unit_of_measure or "Not stated"}
+            Research:
             {research}
-
             Today is {datetime.now().strftime("%Y-%m-%d")}.
-
             {lower_bound_message}
             {upper_bound_message}
-
-            Formatting Instructions:
-            - Please notice the units requested (e.g. whether you represent a number as 1,000,000 or 1 million).
-            - Never use scientific notation.
-            - Always start with a smaller number (more negative if negative) and then increase from there
-
-            Before answering you write:
-            (a) The time left until the outcome to the question is known.
-            (b) The outcome if nothing changed.
-            (c) The outcome if the current trend continued.
-            (d) The expectations of experts and markets.
-            (e) A brief description of an unexpected scenario that results in a low outcome.
-            (f) A brief description of an unexpected scenario that results in a high outcome.
-
-            You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
-
+            Write your rationale, considering expert expectations and unexpected scenarios.
             The last thing you write is your final answer as:
             "
             Percentile 10: XX
-            Percentile 20: XX
-            Percentile 40: XX
-            Percentile 60: XX
-            Percentile 80: XX
+            Percentile 50: XX
             Percentile 90: XX
             "
             """
         )
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
-        percentile_list: list[Percentile] = await structure_output(
-            reasoning, list[Percentile], model=self.get_llm("parser", "llm")
-        )
-        prediction = NumericDistribution.from_question(percentile_list, question)
-        logger.info(
-            f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}"
-        )
-        return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
+        reasonings = await self._get_reasonings_from_all_models(prompt)
+        parsing_tasks = [structure_output(r, list[Percentile], self.get_llm("parser", "llm")) for r in reasonings if not isinstance(r, Exception)]
+        predictions = await asyncio.gather(*parsing_tasks, return_exceptions=True)
+        valid_preds = [p for p in predictions if not isinstance(p, Exception)]
+        if not valid_preds: raise ValueError("All model predictions failed parsing.")
+        median_percentiles = []
+        percentile_levels = sorted({p.percentile for pred_list in valid_preds for p in pred_list})
+        for level in percentile_levels:
+            values = [p.value for pred_list in valid_preds for p in pred_list if p.percentile == level]
+            if values:
+                median_percentiles.append(Percentile(percentile=level, value=np.median(values)))
+        final_prediction = NumericDistribution.from_question(median_percentiles, question)
+        combined_reasoning = self._combine_reasonings_for_comment(reasonings)
+        logger.info(f"Forecasted {question.page_url} with prediction: {final_prediction.declared_percentiles}")
+        return ReasonedPrediction(prediction_value=final_prediction, reasoning=combined_reasoning)
 
-    def _create_upper_and_lower_bound_messages(
-        self, question: NumericQuestion
-    ) -> tuple[str, str]:
-        if question.nominal_upper_bound is not None:
-            upper_bound_number = question.nominal_upper_bound
-        else:
-            upper_bound_number = question.upper_bound
-        if question.nominal_lower_bound is not None:
-            lower_bound_number = question.nominal_lower_bound
-        else:
-            lower_bound_number = question.lower_bound
-
-        if question.open_upper_bound:
-            upper_bound_message = f"The question creator thinks the number is likely not higher than {upper_bound_number}."
-        else:
-            upper_bound_message = (
-                f"The outcome can not be higher than {upper_bound_number}."
-            )
-
-        if question.open_lower_bound:
-            lower_bound_message = f"The question creator thinks the number is likely not lower than {lower_bound_number}."
-        else:
-            lower_bound_message = (
-                f"The outcome can not be lower than {lower_bound_number}."
-            )
-        return upper_bound_message, lower_bound_message
+    def _create_upper_and_lower_bound_messages(self, question: NumericQuestion) -> tuple[str, str]:
+        upper_bound = question.nominal_upper_bound or question.upper_bound
+        lower_bound = question.nominal_lower_bound or question.lower_bound
+        upper_msg = f"Likely not higher than {upper_bound}." if question.open_upper_bound else f"Cannot be higher than {upper_bound}."
+        lower_msg = f"Likely not lower than {lower_bound}." if question.open_lower_bound else f"Cannot be lower than {lower_bound}."
+        return upper_msg, lower_msg
 
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    )
-
-    # Suppress LiteLLM logging
-    litellm_logger = logging.getLogger("LiteLLM")
-    litellm_logger.setLevel(logging.WARNING)
-    litellm_logger.propagate = False
-
-    parser = argparse.ArgumentParser(
-        description="Run the Q1TemplateBot forecasting system"
+    parser = argparse.ArgumentParser(description="Run the UnifiedForecastingBot.")
+    parser.add_argument(
+        "--mode", type=str, choices=["tournament", "test_questions"],
+        default="tournament", help="Specify the run mode.",
     )
     parser.add_argument(
-        "--mode",
-        type=str,
-        choices=["tournament", "market-pulse-25q3", "metaculus-cup-fall-2025"],
-        default="tournament",
-        help="Specify the run mode (default: tournament)",
+        "--tournament-ids", nargs='+', type=str,
+        help="One or more tournament IDs or slugs to forecast on."
     )
     args = parser.parse_args()
-    run_mode: Literal["tournament", "market-pulse-25q3", "metaculus-cup-fall-2025"] = args.mode
-    assert run_mode in [
-        "tournament",
-        "market-pulse-25q3",
-        "metaculus-cup-fall-2025",
-    ], "Invalid run mode"
+    run_mode: Literal["tournament", "test_questions"] = args.mode
 
-    template_bot = FallTemplateBot2025(
+    unified_bot = UnifiedForecastingBot(
         research_reports_per_question=1,
-        predictions_per_research_report=5,
-        use_research_summary_to_forecast=False,
+        predictions_per_research_report=1,
         publish_reports_to_metaculus=True,
-        folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
-        # llms={  # choose your model names or GeneralLlm llms here, otherwise defaults will be chosen for you
-        #     "default": GeneralLlm(
-        #         model="openrouter/openai/gpt-4o", # "anthropic/claude-3-5-sonnet-20241022", etc (see docs for litellm)
-        #         temperature=0.3,
-        #         timeout=40,
-        #         allowed_tries=2,
-        #     ),
-        #     "summarizer": "openai/gpt-4o-mini",
-        #     "researcher": "asknews/deep-research/low", 
-        #     "parser": "openai/gpt-4o-mini",
-        # },
+        llms={
+            "default": GeneralLlm(model="openai/gpt-4o-mini"),
+            "summarizer": GeneralLlm(model="openai/gpt-4o-mini"),
+            "researcher": GeneralLlm(model="openai/gpt-4o-mini", temperature=0.1),
+            "parser": GeneralLlm(model="openai/gpt-4o-mini"),
+            # --- Three-Model Ensemble for Forecasting (No GPT-3.5) ---
+            "forecaster_1": GeneralLlm(model="qwen/qwen-2-72b-instruct", temperature=0.3),
+            "forecaster_2": GeneralLlm(model="openai/gpt-4o-mini", temperature=0.3),
+            "forecaster_3": GeneralLlm(model="mistralai/mistral-large-latest", temperature=0.3),
+        },
     )
 
-    if run_mode == "tournament":
-        seasonal_tournament_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                MetaculusApi.CURRENT_AI_COMPETITION_ID, return_exceptions=True
+    forecast_reports = []
+    try:
+        if run_mode == "tournament":
+            logger.info("Running in tournament mode...")
+            tournament_ids_to_run = args.tournament_ids or [
+                MetaculusApi.CURRENT_AI_COMPETITION_ID,
+                MetaculusApi.CURRENT_MINIBENCH_ID
+            ]
+            logger.info(f"Targeting tournaments: {tournament_ids_to_run}")
+
+            all_reports = []
+            for tournament_id in tournament_ids_to_run:
+                reports = asyncio.run(
+                    unified_bot.forecast_on_tournament(
+                        tournament_id, return_exceptions=True
+                    )
+                )
+                all_reports.extend(reports)
+            forecast_reports = all_reports
+
+        elif run_mode == "test_questions":
+            logger.info("Running in test questions mode...")
+            EXAMPLE_QUESTIONS = [
+                "https://www.metaculus.com/questions/578/human-extinction-by-2100/",
+                "https://www.metaculus.com/questions/14333/age-of-oldest-human-as-of-2100/",
+                "https://www.metaculus.com/questions/22427/number-of-new-leading-ai-labs/",
+            ]
+            questions = [MetaculusApi.get_question_by_url(url) for url in EXAMPLE_QUESTIONS]
+            forecast_reports = asyncio.run(
+                unified_bot.forecast_questions(questions, return_exceptions=True)
             )
-        )
-        minibench_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                MetaculusApi.CURRENT_MINIBENCH_ID, return_exceptions=True
-            )
-        )
-        forecast_reports = seasonal_tournament_reports + minibench_reports
-    elif run_mode == "market-pulse-25q3":
-        # The Metaculus cup is a good way to test the bot's performance on regularly open questions. You can also use AXC_2025_TOURNAMENT_ID = 32564 or AI_2027_TOURNAMENT_ID = "ai-2027"
-        # The Metaculus cup may not be initialized near the beginning of a season (i.e. January, May, September)
-        template_bot.skip_previously_forecasted_questions = False
-        forecast_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                MetaculusApi.CURRENT_METACULUS_CUP_ID, return_exceptions=True
-            )
-        )
-    elif run_mode == "test_questions":
-        # Example questions are a good way to test the bot's performance on a single question
-        EXAMPLE_QUESTIONS = [
-            "https://www.metaculus.com/questions/578/human-extinction-by-2100/",  # Human Extinction - Binary
-            "https://www.metaculus.com/questions/14333/age-of-oldest-human-as-of-2100/",  # Age of Oldest Human - Numeric
-            "https://www.metaculus.com/questions/22427/number-of-new-leading-ai-labs/",  # Number of New Leading AI Labs - Multiple Choice
-            "https://www.metaculus.com/c/diffusion-community/38880/how-many-us-labor-strikes-due-to-ai-in-2029/",  # Number of US Labor Strikes Due to AI in 2029 - Discrete
-        ]
-        template_bot.skip_previously_forecasted_questions = False
-        questions = [
-            MetaculusApi.get_question_by_url(question_url)
-            for question_url in EXAMPLE_QUESTIONS
-        ]
-        forecast_reports = asyncio.run(
-            template_bot.forecast_questions(questions, return_exceptions=True)
-        )
-    template_bot.log_report_summary(forecast_reports)
+
+        unified_bot.log_report_summary(forecast_reports)
+        logger.info("Run finished successfully.")
+
+    except Exception as e:
+        logger.error(f"Run failed with a critical error: {e}", exc_info=True)
+
