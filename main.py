@@ -388,8 +388,7 @@ if __name__ == "__main__":
         committee_bot.log_report_summary(forecast_reports)
         logger.info("Run finished successfully.")
     except Exception as e:
-        logger.error(f"Run failed with a critical error: {e}", exc_info=True)            synthesized_research = await self.get_llm("researcher", "llm").invoke(synthesis_prompt)
-
+        logger.error(f"Run failed with a critical error: {e}", exc_info=True)         
             logger.info(f"--- Research Complete for Q {question.page_url} ---\n{synthesized_research[:400]}...\n--------------------")
             return synthesized_research
 
